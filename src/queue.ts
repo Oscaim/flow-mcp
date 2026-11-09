@@ -18,6 +18,7 @@ export interface SceneParams {
   reference_from?: string;
   edit_asset?: string;
   agent_scenes?: string[];
+  agent_image_model?: "latest" | "Nano Banana Pro" | "Nano Banana 2.1" | "Nano Banana 2 Lite";
   // The scene number each agent scene is saved as. A retry of scenes 7 and 12 keeps scene-07 and scene-12; without it
   // the numbers run on from file_stem.
   agent_numbers?: number[];
@@ -41,6 +42,8 @@ export interface Job {
   status: JobStatus;
   params: SceneParams;
   files: string[];
+  // Successfully renamed Flow media, in output order; used to reuse the previous image without re-uploading it.
+  flow_asset_titles?: string[];
   attempts: number;
   credits?: number;
   progress?: string;

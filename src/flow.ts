@@ -1,4 +1,5 @@
 import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { randomInt } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { basename, extname, isAbsolute, join } from "node:path";
 import type { Locator, Page } from "playwright-core";
@@ -61,14 +62,17 @@ async function clearBackdrops(page: Page): Promise<void> {
 }
 
 // The agent's own image model, set to the newest Nano Banana like single images. Best effort: a batch never fails over it.
-async function pickAgentImageModel(page: Page): Promise<void> {
+async function pickAgentImageModel(page: Page, requested = "latest"): Promise<void> {
   const button = page.locator("flow-agent-panel").getByRole("button", { name: "Image generation default model" });
   if (!(await button.isVisible().catch(() => false))) return;
   await button.click({ timeout: 5000 }).catch(() => {});
   const items = page.getByRole("menuitem");
   if (!(await items.first().isVisible().catch(() => false))) await items.first().waitFor({ state: "visible", timeout: 4000 }).catch(() => {});
   const names = (await items.allInnerTexts().catch(() => [] as string[])).map((t) => t.replace(/\s+/g, " ").trim());
-  const index = newestNanoBanana(names);
+  const index = requested === "latest"
+    ? newestNanoBanana(names)
+    : names.findIndex((n) => n.toLowerCase().includes(requested.toLowerCase()));
+  if (index < 0) throw new Error(`Agent image model "${requested}" not found. Available here: ${names.join(", ")}`);
   const shown = (await button.innerText().catch(() => "")).replace(/\s+/g, " ");
   if (index >= 0 && !shown.includes(names[index])) await items.nth(index).click({ timeout: 4000 }).catch(() => {});
   else await page.keyboard.press("Escape");
@@ -684,8 +688,13 @@ async function downloadTile(page: Page, target: Locator | TileResolver, targetSt
       const original = page.getByRole("menuitem", { name: /original/i }).first();
       if (await original.waitFor({ state: "visible", timeout: 3000 }).then(() => true, () => false)) {
         const upscaled = page.locator('[role="menuitem"]:not([aria-disabled="true"]):not([disabled])').filter({ hasText: /upscaled/i }).first();
-        const wanted = quality === "upscaled" && (await upscaled.isVisible().catch(() => false)) ? upscaled : original;
+        if (quality === "upscaled" && !(await upscaled.isVisible().catch(() => false))) {
+          throw new Error("Flow does not offer an enabled upscaled download for this asset; original was not substituted.");
+        }
+        const wanted = quality === "upscaled" ? upscaled : original;
         await wanted.click();
+      } else if (quality === "upscaled") {
+        throw new Error("Flow's download size submenu did not appear; cannot confirm an upscaled download.");
       }
       // Upscales are rendered on demand, so they can take minutes to appear.
       const file = await waitForDownloadedFile(page, before, quality === "upscaled" ? 600_000 : 180_000);
@@ -847,6 +856,7 @@ export async function runGeneration(job: Job): Promise<string[]> {
     // later lookup - download, continue, assemble - unambiguous. Best effort: a failed rename must not lose the clip.
     const newTitle = `${basename(s.output_dir)}-${label}`;
     const renamed = await renameTile(page, mediaTile(page, id), newTitle).catch(() => false);
+    if (renamed) (job.flow_asset_titles ??= [])[i] = newTitle;
     if (renamed) job.note = [job.note, `renamed in Flow to ${newTitle}`].filter(Boolean).join(" · ");
     await pause(page, 800);
     const stem = join(s.output_dir, label);
@@ -1189,7 +1199,7 @@ export function rememberCharacter(name: string, look: string): void {
   writeFileSync(LOOKS_FILE, JSON.stringify(all, null, 2));
 }
 
-export async function createCharacter(c: CharacterParams, job?: Job): Promise<{ name: string; url: string; portrait?: string; configuration: { body: string; voice: string } }> {
+export async function createCharacter(c: CharacterParams, job?: Job): Promise<{ name: string; url: string; portrait?: string; body_image?: string; configuration: { body: string; voice: string } }> {
   if ((c.voice_sample || c.voice_performance) && !c.voice) throw new Error("A voice is required for voice_sample or voice_performance.");
   if (c.voice_performance && (!c.voice_sample || !c.voice_custom_name)) throw new Error("voice_performance requires voice_sample and voice_custom_name; no character was created.");
   if (c.voice_custom_name && !c.voice_performance) throw new Error("voice_custom_name requires voice_performance; no character was created.");
@@ -1197,7 +1207,9 @@ export async function createCharacter(c: CharacterParams, job?: Job): Promise<{ 
   const state = await getFlowState();
   if (!state.signedIn || !state.inProject) throw new Error(state.hint);
   const page = await getFlowPage();
-  // A description generates the portrait first (free image), then the character is built from that picture.
+  // Build both visual references before entering Flow's character editor. The portrait is the identity anchor for
+  // the full-body image, so the body generation uses that exact portrait as an ingredient rather than reinterpreting
+  // the text prompt independently.
   let portrait: string | undefined;
   if (!c.image) {
     if (!c.describe) throw new Error("Pass either an image or a description for the character.");
@@ -1207,7 +1219,7 @@ export async function createCharacter(c: CharacterParams, job?: Job): Promise<{ 
       ...(job ?? ({ id: "char", status: "running", files: [], attempts: 1, createdAt: "" } as unknown as Job)),
       files: [],
       params: {
-        prompt: c.describe,
+        prompt: `${c.describe}\n\nPORTRAIT REFERENCE: one person, head and shoulders, face clearly visible, centered, simple uncluttered background. This image establishes the character's exact identity, face, hair, and costume for the matching full-body reference.`,
         type: "image",
         model: "Nano Banana Pro",
         max_credits: 0,
@@ -1219,6 +1231,46 @@ export async function createCharacter(c: CharacterParams, job?: Job): Promise<{ 
     portrait = made[0];
     c = { ...c, image: portrait };
   }
+
+  const suppliedBodyImage = Boolean(c.body_image);
+  let bodyImage = c.body_image;
+  if (!bodyImage) {
+    if (job) job.progress = "generating a full-body reference from the portrait";
+    const dir = join(process.env.FLOW_MCP_OUTPUT ?? join(homedir(), "flow-mcp-out"), "_cast");
+    const stem = `${c.name.replace(/[^\w.-]+/g, "_")}-body-${Date.now()}`;
+    const bodyJob = {
+      ...(job ?? ({ id: "char-body", status: "running", files: [], attempts: 1, createdAt: "" } as unknown as Job)),
+      files: [],
+      params: {
+        prompt: `Create a full-length, head-to-toe character reference of the exact same person shown in the attached portrait. Preserve the face, age, hair, skin tone, build, costume, colors, accessories, and visual style exactly. Show the entire body standing naturally, including both hands and both feet; do not crop any part. Plain light neutral background, single person, no text, no extra people.`,
+        type: "image" as const,
+        model: "Nano Banana Pro",
+        max_credits: 0,
+        aspect_ratio: "3:4" as const,
+        reference_images: [c.image!],
+        output_dir: dir,
+        file_stem: stem,
+      },
+    } as Job;
+    const madeBody = await runGeneration(bodyJob);
+    bodyImage = madeBody[0];
+    if (!bodyImage) throw new Error(`Flow did not return a full-body reference for ${c.name}; the character was not created.`);
+  }
+
+  // If the caller leaves the voice open, choose a stock voice from the character's gender and traits, then create a
+  // custom performance so the delivery and name pronunciation travel with the reusable Flow character.
+  const voiceClues = `${c.describe ?? ""} ${c.personality ?? ""}`.toLowerCase();
+  const feminine = /\b(woman|female|girl|lady|mujer|femenin[oa]|chica|niña|jugadora|profesora|reina|heroína)\b/.test(voiceClues);
+  const masculine = /\b(man|male|boy|gentleman|hombre|masculin[oa]|chico|niño|jugador|profesor|rey|héroe)\b/.test(voiceClues);
+  // With no clear gender cue, avoid always imposing the same gendered preset. An explicitly supplied voice wins.
+  const defaultVoice = c.voice ?? (feminine !== masculine ? (feminine ? "Callirrhoe" : "Achird") : ["Callirrhoe", "Achird"][randomInt(2)]);
+  const spanish = /\b(una|un|que|con|cabello|mujer|hombre|simpátic[oa]|inteligente|divertid[oa]|misterios[oa]|pilota|personaje|juega|juegue|básquet|basquet|baloncesto|femenin[oa]|masculin[oa])\b/.test(voiceClues);
+  const voiceSample = c.voice_sample ?? (spanish
+    ? `Hola, soy ${c.name}. Me alegra que estemos aquí; cada día trae algo nuevo.`
+    : `Hello, I'm ${c.name}. I'm glad we're here; every day brings something new.`).slice(0, 120);
+  const voicePerformance = c.voice_performance ?? `Speak clearly and naturally in ${spanish ? "neutral Latin American Spanish" : "clear natural English"}. Pronounce the character name “${c.name}” clearly and consistently. Keep a ${feminine ? "warm, expressive" : masculine ? "confident, approachable" : "clear, approachable"} delivery suited to this character: ${c.personality ?? "friendly, thoughtful, and engaging"}.`;
+  const voiceCustomName = c.voice_custom_name ?? `${c.name} Voice`.slice(0, 60);
+  c = { ...c, body_image: bodyImage, voice: defaultVoice, voice_sample: voiceSample, voice_performance: voicePerformance, voice_custom_name: voiceCustomName };
   const image = c.image!;
   const projectUrl = page.url();
   await dismissOverlays(page);
@@ -1356,9 +1408,9 @@ export async function createCharacter(c: CharacterParams, job?: Job): Promise<{ 
   if (await clear.isVisible().catch(() => false)) await clear.click();
   await showAllMedia(page);
   if (c.describe) rememberCharacter(c.name, c.describe);
-  return { name: c.name, url, portrait, configuration: {
-    body: c.body_image ? "uploaded" : "not_requested",
-    voice: c.voice ? `requested:${c.voice_custom_name ?? c.voice}` : "not_requested",
+  return { name: c.name, url, portrait, body_image: bodyImage, configuration: {
+    body: suppliedBodyImage ? "uploaded" : "generated_from_portrait_and_added",
+    voice: `custom:${c.voice_custom_name} (based on ${c.voice})`,
   } };
 }
 
@@ -1450,7 +1502,7 @@ async function setAgentMode(page: Page, on: boolean): Promise<void> {
 }
 
 // "Never" lets the agent generate without asking; it is switched back to "Always" as soon as the batch ends.
-async function setAgentSettings(page: Page, confirm: "Always" | "Never", imageAspect?: string): Promise<void> {
+async function setAgentSettings(page: Page, confirm: "Always" | "Never", imageAspect?: string, imageModel = "latest"): Promise<void> {
   // Scoped to the prompt box: Flow added a second "Settings" button to the top bar ("View settings", seen 2026-10-13),
   // and an unscoped lookup matched both and failed every agent batch.
   await clearBackdrops(page);
@@ -1461,7 +1513,7 @@ async function setAgentSettings(page: Page, confirm: "Always" | "Never", imageAs
     if (imageAspect) {
       await page.getByRole("radio", { name: imageAspect, exact: true }).first().click();
       await page.getByRole("radio", { name: "x1", exact: true }).first().click();
-      await pickAgentImageModel(page);
+      await pickAgentImageModel(page, imageModel);
     }
     await pause(page, 300);
     await page.getByRole("button", { name: "Save", exact: true }).click();
@@ -1724,7 +1776,7 @@ export async function runContinue(job: Job): Promise<string[]> {
     }
 
     // 4. Agent mode asks for confirmation unless told not to, which would stall an unattended run.
-    await setAgentSettings(page, "Never", s.aspect_ratio ?? "16:9");
+    await setAgentSettings(page, "Never", s.aspect_ratio ?? "16:9", s.agent_image_model ?? "latest");
     // Agent mode treats both chips as ingredients and decides what to do with them. Attaching the saved frame is not
     // enough - without being told, the agent reads it as a style reference and stages a fresh shot. It has to be told
     // in words that the frame IS the opening frame. (Cost 15 credits to learn on 2026-09-20.)
@@ -1876,6 +1928,7 @@ export async function runAgentBatch(job: Job): Promise<string[]> {
         max_credits: 0,
         reference_images: refsFor(i),
         aspect_ratio: s.aspect_ratio,
+        model: s.agent_image_model ?? "latest",
         download_quality: s.download_quality,
         output_dir: s.output_dir,
         file_stem: `scene-${String(numberOf(i)).padStart(2, "0")}`,

@@ -91,7 +91,7 @@ server.registerTool(
   {
     title: "Flow status",
     description:
-      "Check the Flow Chrome session (signed in, project open, plan, credits left) and the generation queue. Call this first; it says what the user must fix before generating, and returns the prompt playbook.",
+      "Check the Flow Chrome session (signed in, project open, plan, credits left) and generation queue. Call before Flow work. If signed in but no project is open, use flow_projects and flow_open_project to select the relevant remembered project, or flow_create_project when a fresh project is requested/needed; then check status again. Only sign-in or genuine project-choice ambiguity requires the user.",
     inputSchema: shapes.status,
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
@@ -172,7 +172,7 @@ server.registerTool(
   {
     title: "Fast image batch via Flow's agent",
     description:
-      "Hand up to 50 image scenes to Flow's own Agent mode, which renders them all in parallel (minutes for a whole batch instead of one paced job per scene) and enriches each prompt itself. Images only, 0 credits. Pass `references` (characters, places, objects, each with a short name) to attach them once in the agent's composer, the way its + button does, and `scene_references` to say which scenes use which, so a whole story stays on-model. Scenes the agent drops are asked for again, then made one by one with their references. Less exact than flow_generate: the agent picks the wording, no techniques, and each image is matched back to its scene by its stored prompt. Returns a job id; use flow_wait.",
+      "Hand up to 50 image scenes to Flow's Agent mode for parallel batch generation. Select `image_model` (latest, Nano Banana Pro, Nano Banana 2.1, or Nano Banana 2 Lite); latest chooses the newest numbered model. Images use daily model quotas rather than monthly Flow video credits. Agent may enrich prompts; missing images are retried, then generated one by one. Pass `references` and `scene_references` to attach shared character/place/object references. Results are matched to prompts and returned as a job; use flow_wait. For more exact prompt control and per-scene settings, use flow_generate.",
     inputSchema: shapes.agent,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
@@ -231,7 +231,7 @@ server.registerTool("flow_character_body", {
 
 server.registerTool("flow_create_project", {
   title: "Create a named Flow project",
-  description: "Create and name a new project in Flow and save its ID and name in local project memory. If creation is uncertain, inspect Flow before retrying.",
+  description: "Create and name a new project in Flow and save its ID and name in local project memory. Use when the user requests a fresh project or the task needs one and no relevant remembered project exists. If creation is uncertain, inspect Flow before retrying.",
   inputSchema: shapes.create_project,
   annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
 }, (args) => reply(patient("flow_create_project", core.create_project(args))));
@@ -245,7 +245,7 @@ server.registerTool("flow_projects", {
 
 server.registerTool("flow_open_project", {
   title: "Open a Flow project",
-  description: "Open an existing Flow project by remembered exact name, UUID or URL in Chrome and remember its current name locally.",
+  description: "Open an existing Flow project by remembered exact name, UUID or URL in Chrome and remember its current name locally. Use to recover automatically when flow_status says no project is open, choosing the project relevant to the current task.",
   inputSchema: shapes.open_project,
   annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
 }, (args) => reply(core.open_project(args)));
@@ -262,7 +262,7 @@ server.registerTool(
   {
     title: "Create a reusable character",
     description:
-      "Create a reusable Flow character from a portrait, optionally a separate body image, personality and voice. voice_sample requests a preview; voice_performance plus voice_custom_name requests an EXPERIMENTAL custom voice, requiring voice_sample. The preview can fail; check a partially created character and any custom voice before retrying. The sample is a preview, not scene dialogue. Afterwards reference 'asset:<name>'.",
+      "Complete character workflow: generate a Nano Banana Pro portrait, use that exact portrait as a reference to generate a matching full-body image, then create the reusable Flow character with both images, personality, and a voice. If voice is omitted, choose a fitting preset and create a custom voice performance with a short sample in the character's language, including name pronunciation. Custom voices are experimental in Flow; if their preview/save fails, inspect the partially created character before retrying. The sample is only a voice preview, not saved scene dialogue. Afterwards reference 'asset:<name>'.",
     inputSchema: shapes.character,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },

@@ -41,7 +41,7 @@ headless or asleep mid-run.
 ## Install
 
 ```bash
-git clone <URL-de-tu-repositorio>
+git clone https://github.com/Oscaim/flow-mcp.git
 cd flow-mcp
 npm install
 npm run build

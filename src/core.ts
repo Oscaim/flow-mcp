@@ -19,7 +19,7 @@ const words = (s: string) => s.split(/[^a-z0-9]+/i).filter((w) => w.length > 3).
 export const projectDir = (project: string) => resolve(OUTPUT_ROOT, project.replace(/[^\w.-]+/g, "_"));
 
 const sceneSchema = z.object({
-  prompt: z.string().min(1).describe("Full English prompt for one clip: action, shot and camera move, location, style, light, sound."),
+  prompt: z.string().min(1).describe("Full English prompt: name and describe every character appearing, including characters in reference images or frames, then action, shot, camera move, location, style, light and sound."),
   type: z.enum(["video", "image"]).default("video"),
   model: z
     .string()
@@ -30,16 +30,16 @@ const sceneSchema = z.object({
   resolution: z.enum(["360p", "720p"]).optional().describe("Video resolution. Omni models only."),
   max_credits: z.number().int().min(0).default(25).describe("Safety cap: the scene is skipped (nothing spent) if Flow quotes more credits than this."),
   variants: z.number().int().min(1).max(4).optional().describe("Outputs per prompt (each one spends credits). Default 1."),
-  first_frame: z.string().optional().describe("First frame: absolute image path, or 'asset:<title>' for an image already in the Flow project."),
-  last_frame: z.string().optional().describe("Last frame: absolute image path, or 'asset:<title>'."),
+  first_frame: z.string().optional().describe("First frame: prefer 'asset:<title>' to reuse an image already in the Flow project without uploading. Use a local path only for media not already available there."),
+  last_frame: z.string().optional().describe("Last frame: prefer 'asset:<title>' for existing Flow media; otherwise use an absolute local path."),
   reference_images: z
     .array(z.string())
     .max(3)
     .optional()
     .describe(
-      "Reference media: absolute image paths, or 'asset:<title>' for media or characters already in the Flow project. Flow's COMPOSER takes references OR first/last frames on a video scene, never both, so with frames set these are skipped and the job says so. Flow itself can do both via agent mode (save the last frame, Animate it, then add the character).",
+      "Reference media: prefer 'asset:<title>' for media or characters already in the Flow project, selecting them directly without uploading; use local paths only for media not already available. Flow's COMPOSER takes references OR first/last frames on a video scene, never both, so with frames set these are skipped and the job says so. Flow itself can do both via agent mode (save the last frame, Animate it, then add the character).",
     ),
-  download_quality: z.enum(["original", "upscaled"]).optional().describe("'upscaled' fetches 1080p video / 2K image (free, slower). Default original."),
+  download_quality: z.enum(["original", "upscaled"]).optional().describe("'upscaled' requests Flow's native upscale (available resolution depends on the source and Flow); never silently substitutes the original. Default original."),
   retries: z.number().int().min(0).max(3).default(1).describe("Automatic retries when Flow itself reports the generation failed."),
   technique: z.string().optional().describe("Id from flow_techniques (e.g. 'orbit-360'); its exact phrase is appended to the prompt. One per scene."),
   reference_previous: z
@@ -116,7 +116,7 @@ export const shapes = {
   download: {
     project: z.string().min(1).describe("Local folder name under the output root."),
     assets: z.array(z.string().min(1)).min(1).max(30).describe("Titles (or title prefixes) from flow_assets, in the order they should be numbered."),
-    quality: z.enum(["original", "upscaled"]).default("original"),
+    quality: z.enum(["original", "upscaled"]).default("original").describe("Use upscaled for Flow's native upscaled download; the available resolution depends on the source and Flow."),
   },
   assemble: {
     project: z.string().min(1).describe("Same project name used in flow_generate."),
@@ -163,11 +163,12 @@ export const shapes = {
     project: z.string().min(1).describe("Folder name for the downloaded images."),
     scenes: z.array(z.string().min(1)).min(1).max(50).describe("One image description per scene, in order."),
     aspect_ratio: z.enum(["16:9", "9:16", "1:1", "4:3", "3:4"]).default("16:9"),
+    image_model: z.enum(["latest", "Nano Banana Pro", "Nano Banana 2.1", "Nano Banana 2 Lite"]).default("latest").describe("Agent image model. 'latest' picks the newest numbered Nano Banana model; choose a specific model to pin the batch."),
     download_quality: z.enum(["original", "upscaled"]).optional(),
     references: z
       .array(
         z.object({
-          image: z.string().min(1).describe("Absolute image path, or 'asset:<title>' for an image or character already in the Flow project."),
+          image: z.string().min(1).describe("Prefer 'asset:<title>' for an image or character already in this Flow project, so it is selected without uploading. Use an absolute local path only for media not already available in Flow."),
           name: z.string().min(1).max(40).describe("Short name the scenes use for it, e.g. 'Ines' or 'the station'."),
         }),
       )
@@ -256,7 +257,7 @@ export const shapes = {
     voice_sample: z.string().trim().min(1).max(120).optional().describe("Words for Flow's voice preview (up to 120 characters). Used for preview only; not saved as character dialogue."),
     voice_performance: z.string().trim().min(1).max(1000).optional().describe("Experimental: performance direction for a new custom voice. Requires voice, voice_sample and voice_custom_name. Flow must successfully generate the preview before saving; this may fail in Flow."),
     voice_custom_name: z.string().trim().min(1).max(60).optional().describe("Unique name for the new custom voice when voice_performance is specified."),
-    body_image: z.string().min(1).optional().describe("Optional absolute local image path for the separate Body slot. Portrait and body are separate. This uploads an existing image; it does not generate a body."),
+    body_image: z.string().min(1).optional().describe("Optional absolute local path for a full-body reference you already have. If omitted, Flow MCP automatically generates a full-body image from the exact portrait and adds it to the Body slot."),
     name: z.string().min(1).max(60).describe("Character name; scenes then reference it as 'asset:<name>' in reference_images."),
     describe: z
       .string()
@@ -374,9 +375,11 @@ export class LocalCore implements Core {
   private queue: JobQueue = new JobQueue(async (job) => {
     const { chain_from, reference_from } = job.params;
     if (reference_from) {
-      const still = this.queue.get(reference_from)?.files.find((f) => /\.(jpe?g|png|webp)$/i.test(f));
+      const prior = this.queue.get(reference_from);
+      const still = prior?.files.find((f) => /\.(jpe?g|png|webp)$/i.test(f));
       if (!still) throw new Error(`reference_previous: the previous scene (${reference_from}) produced no image.`);
-      job.params.reference_images = [still, ...(job.params.reference_images ?? [])].slice(0, 3);
+      const reference = prior?.flow_asset_titles?.[0] ? `asset:${prior.flow_asset_titles[0]}` : still;
+      job.params.reference_images = [reference, ...(job.params.reference_images ?? [])].slice(0, 3);
     }
     if (chain_from) {
       const clip = this.queue.get(chain_from)?.files.find((f) => /\.(mp4|webm|mov)$/i.test(f));
@@ -580,7 +583,7 @@ export class LocalCore implements Core {
     return `${prefix}-${String(Math.max(0, ...onDisk, ...queued) + 1).padStart(2, "0")}`;
   }
 
-  async agent({ project, scenes, aspect_ratio, download_quality, references, scene_references }: Args<"agent">) {
+  async agent({ project, scenes, aspect_ratio, image_model, download_quality, references, scene_references }: Args<"agent">) {
     const output_dir = projectDir(project);
     if (scene_references && scene_references.length !== scenes.length) {
       throw new Error(`scene_references has ${scene_references.length} entries for ${scenes.length} scenes; give one list per scene (empty for none).`);
@@ -598,6 +601,7 @@ export class LocalCore implements Core {
       type: "image",
       max_credits: 0,
       aspect_ratio,
+      agent_image_model: image_model,
       download_quality,
       agent_scenes: scenes,
       output_dir,
@@ -664,7 +668,7 @@ export class LocalCore implements Core {
   }
 
   async character(a: Args<"character">) {
-    if (this.queue.busy) throw new Error(BUSY);
+    if (this.queue.list().some(j => j.status === "running" || j.status === "queued")) throw new Error(BUSY);
     if (!a.image && !a.describe) throw new Error("Pass either `describe` (Flow draws the portrait) or `image`.");
     if ((a.voice_sample || a.voice_performance) && !a.voice) throw new Error("voice_sample and voice_performance require a voice.");
     if (a.voice_performance && (!a.voice_sample || !a.voice_custom_name)) throw new Error("voice_performance requires voice_sample and voice_custom_name. No character was created.");
