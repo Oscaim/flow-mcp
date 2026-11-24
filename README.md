@@ -1,6 +1,6 @@
 # Copia personalizada de Flow MCP
 
-Basada en https://github.com/GTAI-1/flow-mcp. Cada usuario debe iniciar sesión con su propia cuenta de Google Flow. Los perfiles de navegador, credenciales, proyectos y archivos generados permanecen locales y no se incluyen en este repositorio.
+Basada en https://github.com/GTAI-1/flow-mcp (crédito al autor original; el upstream no publicaba licencia al momento del fork). Licencia de los cambios: ISC (ver LICENSE). Cada usuario debe iniciar sesión con su propia cuenta de Google Flow. Los perfiles de navegador, credenciales, proyectos y archivos generados permanecen locales y no se incluyen en este repositorio.
 
 # flow-mcp
 
